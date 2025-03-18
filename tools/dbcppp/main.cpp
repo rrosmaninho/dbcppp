@@ -2,21 +2,24 @@
 #include <array>
 #include <string>
 #include <vector>
+#include <memory>
 #include <fstream>
 #include <sstream>
 #include <iostream>
 #include <filesystem>
-#include <memory>
 
 #include <cxxopts.hpp>
+#include <nlohmann/json.hpp>
 
 #include "dbcppp/Network.h"
 #include "dbcppp/Network2Functions.h"
 
+using json = nlohmann::json;
+
 void print_help()
 {
     std::cout << "dbcppp v1.0.0\nFor help type: dbcppp <subprogram> --help\n"
-        << "Sub programs: dbc2, decode\n";
+              << "Sub programs: dbc2, decode\n";
 }
 
 int main(int argc, char** argv)
@@ -88,15 +91,18 @@ int main(int argc, char** argv)
     {
         options.add_options()
             ("h,help", "Produce help message")
-            ("bus", "List of buses in format <<bus name>:<DBC filename>>", cxxopts::value<std::vector<std::string>>());
+            ("bus", "List of buses in format <<bus name>:<DBC filename>>", cxxopts::value<std::vector<std::string>>())
+            ("json", "Output in JSON format");
+
         for (std::size_t i = 1; i < argc - 1; i++)
         {
             argv[i] = argv[i + 1];
         }
+
         auto vm = options.parse(argc, argv);
         if (vm.count("help"))
         {
-            std::cout << "Usage:\ndbcppp decode [--help] --bus=<<bus name>:<DBC filename>>...\n";
+            std::cout << "Usage:\ndbcppp decode [--help] --bus=<<bus name>:<DBC filename>> [--json]\n";
             std::cout << options.help();
             return 1;
         }
@@ -105,6 +111,9 @@ int main(int argc, char** argv)
             std::cout << "Argument error: At least one --bus=<<bus name>:<DBC filename>> argument required\n";
             return 1;
         }
+
+        bool json_output = vm.count("json");
+
         const auto& opt_buses = vm["bus"].as<std::vector<std::string>>();
         struct Bus
         {
@@ -112,6 +121,8 @@ int main(int argc, char** argv)
             std::unique_ptr<dbcppp::INetwork> net;
         };
         std::unordered_map<std::string, Bus> buses;
+
+        // Load buses and networks
         for (const auto& opt_bus : opt_buses)
         {
             std::istringstream ss(opt_bus);
@@ -123,7 +134,7 @@ int main(int argc, char** argv)
             }
             else
             {
-                std::cout << "error: could parse bus parameter" << std::endl;
+                std::cout << "error: could not parse bus parameter" << std::endl;
                 return 1;
             }
             if (std::getline(ss, opt))
@@ -138,31 +149,25 @@ int main(int argc, char** argv)
             }
             else
             {
-                std::cout << "error: could parse bus parameter" << std::endl;
+                std::cout << "error: could not parse bus parameter" << std::endl;
                 return 1;
             }
             buses.insert(std::make_pair(b.name, std::move(b)));
         }
-        // example line: vcan0  123   [3]  11 22 33
+
         std::regex regex_candump_line(
-            // vcan0
             "^\\s*(\\S+)"
-            // 123
             "\\s*([0-9A-F]{3})"
-            // 3
             "\\s*\\[(\\d+)\\]"
-            // 11
             "\\s*([0-9A-F]{2})?"
-            // 22
             "\\s*([0-9A-F]{2})?"
-            // 33
             "\\s*([0-9A-F]{2})?"
-            // ...
             "\\s*([0-9A-F]{2})?"
             "\\s*([0-9A-F]{2})?"
             "\\s*([0-9A-F]{2})?"
             "\\s*([0-9A-F]{2})?"
             "\\s*([0-9A-F]{2})?");
+        
         std::string line;
         while (std::getline(std::cin, line))
         {
@@ -178,97 +183,56 @@ int main(int argc, char** argv)
                 {
                     data[i] = uint8_t(std::strtol(cm[4 + i].str().c_str(), nullptr, 16));
                 }
+
                 auto beg_msg = bus->second.net->Messages().begin();
                 auto end_msg = bus->second.net->Messages().end();
                 auto iter = std::find_if(beg_msg, end_msg, [&](const dbcppp::IMessage& msg) { return msg.Id() == msg_id; });
                 if (iter != end_msg)
                 {
                     const dbcppp::IMessage* msg = &*iter;
-                    std::cout << line << " :: " << msg->Name() << "(";
-                    bool first = true;
-                    const auto* mux_sig = msg->MuxSignal();
 
-                    auto print_signal =
-                        [&data](const dbcppp::ISignal& sig, bool first)
+                    if (json_output)
+                    {
+                        json json_output;
+                        json_output["bus"] = cm[1].str();
+                        json_output["message_id"] = msg_id;
+                        json_output["message_name"] = msg->Name();
+                        json_output["signals"] = json::object();
+
+                        for (const dbcppp::ISignal& sig : msg->Signals())
                         {
-                            if (!first) std::cout << ", ";
                             auto raw = sig.Decode(&data[0]);
-                            auto beg_ved = sig.ValueEncodingDescriptions().begin();
-                            auto end_ved = sig.ValueEncodingDescriptions().end();
-                            auto iter = std::find_if(beg_ved, end_ved, [&](const dbcppp::IValueEncodingDescription& ved) { return ved.Value() == raw; });
-                            if (iter != end_ved)
+                            auto iter = std::find_if(
+                                sig.ValueEncodingDescriptions().begin(),
+                                sig.ValueEncodingDescriptions().end(),
+                                [&](const dbcppp::IValueEncodingDescription& ved) { return ved.Value() == raw; });
+
+                            if (iter != sig.ValueEncodingDescriptions().end())
                             {
-                                std::cout << sig.Name() << ": '" << iter->Description() << "' " << sig.Unit();
+                                json_output["signals"][sig.Name()] = iter->Description();
                             }
                             else
                             {
-                                auto val = sig.RawToPhys(raw);
-                                std::cout << sig.Name() << ": " << val;
-                                if (sig.Unit().size())
-                                {
-                                    std::cout << " " << sig.Unit();
-                                }
+                                json_output["signals"][sig.Name()] = sig.RawToPhys(raw);
                             }
-                        };
+                        }
 
-                    for (const dbcppp::ISignal& sig : msg->Signals())
-                    {
-                        if (sig.MultiplexerIndicator() != dbcppp::ISignal::EMultiplexer::MuxValue)
-                        {
-                            print_signal(sig, first);
-                            first = false;
-                        }
-                        else if (mux_sig && sig.SignalMultiplexerValues_Size() == 0 &&
-                            sig.MultiplexerSwitchValue() == mux_sig->Decode(&data[0]))
-                        {
-                            print_signal(sig, first);
-                            first = false;
-                        }
-                        else
-                        {
-                            std::function<bool(const dbcppp::ISignal&)> check_signal_multiplexer_values;
-                            check_signal_multiplexer_values =
-                                [&](const dbcppp::ISignal& sig)
-                                    -> bool
-                                {
-                                    for (const auto& smv : sig.SignalMultiplexerValues())
-                                    {
-                                        auto sig_beg = msg->Signals().begin();
-                                        auto sig_end = msg->Signals().end();
-                                        auto sig_iter = std::find_if(sig_beg, sig_end,
-                                            [&](const auto& sig)
-                                            {
-                                                return sig.Name() == smv.SwitchName();
-                                            });
-                                        if (sig_iter != sig_end)
-                                        {
-                                            for (auto ranges : smv.ValueRanges())
-                                            {
-                                                auto raw = sig_iter->Decode(&data[0]);
-                                                if (ranges.from >= raw && ranges.to <= raw)
-                                                {
-                                                    if (sig_iter->SignalMultiplexerValues_Size() != 0)
-                                                    {
-                                                        return check_signal_multiplexer_values(*sig_iter);
-                                                    }
-                                                    else
-                                                    {
-                                                        return true;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    return false;
-                                };
-                            if (check_signal_multiplexer_values(sig))
-                            {
-                                print_signal(sig, first);
-                                first = false;
-                            }
-                        }
+                        // Print JSON
+                        std::cout << json_output.dump(4) << std::endl;
                     }
-                    std::cout << ")\n";
+                    else
+                    {
+                        // Normal human-readable output
+                        bool first = true;
+                        for (const dbcppp::ISignal& sig : msg->Signals())
+                        {
+                            auto raw = sig.Decode(&data[0]);
+                            if (!first) std::cout << ", ";
+                            std::cout << sig.Name() << ": " << sig.RawToPhys(raw);
+                            first = false;
+                        }
+                        std::cout << std::endl;
+                    }
                 }
             }
         }
@@ -279,3 +243,4 @@ int main(int argc, char** argv)
         return 1;
     }
 }
+
